@@ -49,6 +49,9 @@ class ScenarioTest(tempest.test.BaseTestCase):
         cls.manager = clients.Manager(
             credentials=cls.credentials()
         )
+        cls.admin_manager = clients.Manager(
+            credentials=cls.admin_credentials()
+        )
 
     @classmethod
     def setup_clients(cls):
@@ -71,6 +74,10 @@ class ScenarioTest(tempest.test.BaseTestCase):
         cls.network_client = cls.manager.network_client
         # Heat client
         cls.orchestration_client = cls.manager.orchestration_client
+
+        # Admin clients
+        cls.admin_hosts_client = cls.admin_manager.hosts_client
+        cls.admin_servers_client = cls.admin_manager.servers_client
 
     @classmethod
     def credentials(cls):
