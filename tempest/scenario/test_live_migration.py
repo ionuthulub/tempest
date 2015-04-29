@@ -14,13 +14,13 @@
 #    under the License.
 
 from oslo_log import log as logging
+import testtools
 
 from tempest.common import custom_matchers
 from tempest import config
 from tempest import exceptions
 from tempest.scenario import manager
 from tempest import test
-import testtools
 
 CONF = config.CONF
 
@@ -36,6 +36,50 @@ class TestLiveMigrationScenario(manager.ScenarioTest):
     """
 
     _host_key = 'OS-EXT-SRV-ATTR:host'
+
+    def cinder_create(self):
+        self.volume = self.create_volume()
+
+    def cinder_show(self):
+        volume = self.volumes_client.show_volume(self.volume['id'])
+        self.assertEqual(self.volume, volume)
+
+    def create_and_add_security_group(self):
+        secgroup = self._create_security_group()
+        self.servers_client.add_security_group(self.server['id'],
+                                               secgroup['name'])
+        self.addCleanup(self.servers_client.remove_security_group,
+                        self.server['id'], secgroup['name'])
+
+        def wait_for_secgroup_add():
+            body = self.servers_client.get_server(self.server['id'])
+            return {'name': secgroup['name']} in body['security_groups']
+
+        if not test.call_until_true(wait_for_secgroup_add,
+                                    CONF.compute.build_timeout,
+                                    CONF.compute.build_interval):
+            msg = ('Timed out waiting for adding security group %s to server '
+                   '%s' % (secgroup['id'], self.server['id']))
+            raise exceptions.TimeoutException(msg)
+
+    def get_compute_hostnames(self):
+        body = self.admin_hosts_client.list_hosts()
+        return [
+            host_record['host_name']
+            for host_record in body
+            if host_record['service'] == 'compute'
+        ]
+
+    def get_host_for_server(self, server_id):
+        return self.get_server_details(server_id)[self._host_key]
+
+    def get_host_other_than(self, host):
+        for target_host in self.get_compute_hostnames():
+            if host != target_host:
+                return target_host
+
+    def get_server_details(self, server_id):
+        return self.admin_servers_client.get_server(server_id)
 
     def glance_image_create(self):
         img_path = CONF.scenario.img_dir + "/" + CONF.scenario.img_file
@@ -66,83 +110,70 @@ class TestLiveMigrationScenario(manager.ScenarioTest):
                                             properties=properties)
         LOG.debug("image:%s" % self.image)
 
-    def _nova_keypair_add(self):
+    def launch_instance(self):
+        self.glance_image_create()
+        self.nova_keypair_add()
+        self.nova_boot()
+        self.create_and_add_security_group()
+
+    def nova_keypair_add(self):
         self.keypair = self.create_keypair()
 
-    def _nova_boot(self):
+    def migration(self):
+        actual_host = self.get_host_for_server(self.server['id'])
+        target_host = self.get_host_other_than(actual_host)
+        self.admin_servers_client.live_migrate_server(
+            self.server['id'], target_host,
+            CONF.compute_feature_enabled.block_migration_for_live_migration)
+        self.servers_client.wait_for_server_status(self.server['id'], 'ACTIVE')
+        self.assertEqual(target_host, self.get_host_for_server(self.server['id']))
+
+    def nova_boot(self):
         create_kwargs = {'key_name': self.keypair['name']}
         self.server = self.create_server(
             image=self.image, create_kwargs=create_kwargs)
 
-    def _get_compute_hostnames(self):
-        body = self.admin_hosts_client.list_hosts()
-        return [
-            host_record['host_name']
-            for host_record in body
-            if host_record['service'] == 'compute'
-        ]
-
-    def _get_server_details(self, server_id):
-        return self.admin_servers_client.get_server(server_id)
-
-    def _get_host_for_server(self, server_id):
-        return self._get_server_details(server_id)[self._host_key]
-
-    def _migrate_server_to(self, server_id, dest_host):
-        body = self.admin_servers_client.live_migrate_server(
-            server_id, dest_host,
-            CONF.compute_feature_enabled.block_migration_for_live_migration)
-        return body
-
-    def _get_host_other_than(self, host):
-        for target_host in self._get_compute_hostnames():
-            if host != target_host:
-                return target_host
-
-    def _migration(self):
-        actual_host = self._get_host_for_server(self.server['id'])
-        target_host = self._get_host_other_than(actual_host)
-        self._migrate_server_to(self.server['id'], target_host)
-        self.servers_client.wait_for_server_status(self.server['id'], 'ACTIVE')
-        self.assertEqual(target_host, self._get_host_for_server(self.server['id']))
-
-    def _launch_instance(self):
-        self.glance_image_create()
-        self._nova_keypair_add()
-        self._nova_boot()
-
-    @testtools.skipUnless(False, 'skip')
+    # @testtools.skipUnless(False, 'skip')
+    @testtools.skipIf(not CONF.compute_feature_enabled.live_migration,
+                      'Live migration not available')
+    @test.services('compute', 'image', 'network')
     def test_network_connectivity_during_live_migration(self):
-        if len(self._get_compute_hostnames()) < 2:
+        if len(self.get_compute_hostnames()) < 2:
             raise self.skipTest(
                 "Less than 2 compute nodes, skipping migration test.")
-        self._launch_instance()
+        self.launch_instance()
         floating_ip = self.create_floating_ip(self.server)
         linux_client = self.get_remote_client(floating_ip['ip'])
-        self._migration()
+        self.migration()
         linux_client.exec_command('ls')
 
     @testtools.skipUnless(False, 'skip')
+    @testtools.skipIf(not CONF.compute_feature_enabled.live_migration,
+                      'Live migration not available')
+    @test.services('compute', 'volume', 'image', 'network')
     def test_migration_of_vm_with_cinder_volume(self):
-        if len(self._get_compute_hostnames()) < 2:
+        if len(self.get_compute_hostnames()) < 2:
             raise self.skipTest(
                 "Less than 2 compute nodes, skipping migration test.")
-        self._launch_instance()
+        self.launch_instance()
         self.cinder_create()
         self.nova_volume_attach()
         self.addCleanup(self.nova_volume_detach)
-        self._migration()
+        self.migration()
         self.cinder_show()
 
-    # @testtools.skipUnless(False, 'skip')
+    @testtools.skipUnless(False, 'skip')
+    @testtools.skipIf(not CONF.compute_feature_enabled.live_migration,
+                      'Live migration not available')
+    @test.services('compute', 'image', 'network')
     def test_migration_of_vm_with_data_on_root_and_ephemeral_disk(self):
-        if len(self._get_compute_hostnames()) < 2:
+        if len(self.get_compute_hostnames()) < 2:
             raise self.skipTest(
                 "Less than 2 compute nodes, skipping migration test.")
-        self._launch_instance()
+        self.launch_instance()
         floating_ip = self.create_floating_ip(self.server)
         linux_client = self.get_remote_client(floating_ip['ip'])
         linux_client.exec_command('echo "Hello World!" > test_live_migration.txt')
-        self._migration()
+        self.migration()
         output = linux_client.exec_command('cat test_live_migration.txt').strip()
-        self.assertEqual('Hello World!', output)
+        self.assertEqual(output, 'Hello World!')
