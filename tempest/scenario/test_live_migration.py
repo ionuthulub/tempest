@@ -79,8 +79,6 @@ class TestLiveMigrationScenario(manager.ScenarioTest):
 
     def get_host_other_than(self, host):
         for target_host in self.get_compute_hostnames():
-            if target_host == 'controller':
-                continue
             if host != target_host:
                 return target_host
 
