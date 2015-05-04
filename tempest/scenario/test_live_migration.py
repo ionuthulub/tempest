@@ -16,7 +16,6 @@
 from oslo_log import log as logging
 import testtools
 
-from tempest.common import custom_matchers
 from tempest import config
 from tempest import exceptions
 from tempest.scenario import manager
@@ -43,6 +42,11 @@ class TestLiveMigrationScenario(manager.ScenarioTest):
     def cinder_show(self):
         volume = self.volumes_client.show_volume(self.volume['id'])
         self.assertEqual(self.volume, volume)
+
+    def check_partitions(self):
+        # NOTE(andreaf) The device name may be different on different guest OS
+        partitions = self.linux_client.get_partitions()
+        self.assertEqual(1, partitions.count(CONF.compute.volume_device_name))
 
     def create_and_add_security_group(self):
         secgroup = self._create_security_group()
@@ -75,6 +79,8 @@ class TestLiveMigrationScenario(manager.ScenarioTest):
 
     def get_host_other_than(self, host):
         for target_host in self.get_compute_hostnames():
+            if target_host == 'controller':
+                continue
             if host != target_host:
                 return target_host
 
@@ -133,7 +139,6 @@ class TestLiveMigrationScenario(manager.ScenarioTest):
         self.server = self.create_server(
             image=self.image, create_kwargs=create_kwargs)
 
-    # @testtools.skipUnless(False, 'skip')
     @testtools.skipIf(not CONF.compute_feature_enabled.live_migration,
                       'Live migration not available')
     @test.services('compute', 'image', 'network')
@@ -144,10 +149,17 @@ class TestLiveMigrationScenario(manager.ScenarioTest):
         self.launch_instance()
         floating_ip = self.create_floating_ip(self.server)
         linux_client = self.get_remote_client(floating_ip['ip'])
-        self.migration()
-        linux_client.exec_command('ls')
+        initial_output = linux_client.exec_command('ls').strip()
 
-    @testtools.skipUnless(False, 'skip')
+        # linux_client makes a new connection each time exec_command is called,
+        # so we have to use the underlying paramiko.client to establish a
+        # permanent connection
+        ssh = linux_client.ssh_client._get_ssh_connection()
+        self.migration()
+        stdin, stdout, stderr = ssh.exec_command('ls')
+        stdout = stdout.read().strip()
+        self.assertEqual(stdout, initial_output)
+
     @testtools.skipIf(not CONF.compute_feature_enabled.live_migration,
                       'Live migration not available')
     @test.services('compute', 'volume', 'image', 'network')
@@ -156,13 +168,14 @@ class TestLiveMigrationScenario(manager.ScenarioTest):
             raise self.skipTest(
                 "Less than 2 compute nodes, skipping migration test.")
         self.launch_instance()
+        floating_ip = self.create_floating_ip(self.server)
+        self.linux_client = self.get_remote_client(floating_ip['ip'])
         self.cinder_create()
         self.nova_volume_attach()
         self.addCleanup(self.nova_volume_detach)
         self.migration()
-        self.cinder_show()
+        self.check_partitions()
 
-    @testtools.skipUnless(False, 'skip')
     @testtools.skipIf(not CONF.compute_feature_enabled.live_migration,
                       'Live migration not available')
     @test.services('compute', 'image', 'network')
